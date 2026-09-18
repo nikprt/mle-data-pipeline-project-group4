@@ -4,7 +4,30 @@ from urllib.request import urlretrieve
 
 import pandas as pd
 
+from sqlalchemy import create_engine, inspect, text 
+from sqlalchemy.engine import Engine 
+import os
+
+_engine: Engine | None = None
+
 ROOT_PATH = Path(__file__).resolve().parent
+
+def _database_url() -> str:
+    user = os.getenv("PG_USER", "postgres")
+    password = os.environ["PG_PASSWORD"]  # no default — fail loudly if missing
+    host = os.getenv("PG_HOST", "localhost")
+    port = os.getenv("PG_PORT", "5432")
+    db = os.getenv("PG_DATABASE", "ny_taxi_green")
+    return f"postgresql://{user}:{password}@{host}:{port}/{db}"
+
+def get_engine() -> Engine:
+    """Reuse a single engine/connection pool across all batches instead of creating one per call."""
+    
+    global _engine
+    if _engine is None:
+        _engine = create_engine(_database_url())
+    return _engine
+
 
 print(f"ROOT_PATH: {ROOT_PATH}")
 
@@ -28,7 +51,6 @@ def transform_data_batch(df_batch: pd.DataFrame, file_path: str, color_target: s
             "DOLocationID": "do_location_id"
         }
     )
-    
     print(f"DataFrame (batch) shape before transformation = {df_batch.shape}")
     
     df_batch["service_type"] = color_target
@@ -52,7 +74,6 @@ def transform_data_batch(df_batch: pd.DataFrame, file_path: str, color_target: s
         "payment_type", 
         "trip_type"
     ]
-    
     for col in int_cols:
         df_batch[col] = pd.to_numeric(df_batch[col], errors="coerce").astype("Int64")
         
@@ -60,12 +81,38 @@ def transform_data_batch(df_batch: pd.DataFrame, file_path: str, color_target: s
     df_batch = df_batch.drop(columns=["ehail_fee"])
     
     return df_batch
+
+def load_data_batch(df_batch: pd.DataFrame, file_path: str, table_name: str):
+    """Load transformed data batch into PostgreSQL database."""
+    
+    engine = get_engine()
+    
+    with engine.begin() as conn:
+        if inspect(engine).has_table(table_name):
+            # re-running this batch shouldn't duplicate rows — clear just this file's rows first
+            conn.execute(
+                text(f'DELETE FROM "{table_name}" WHERE source_file = :file_path'),
+                {"file_path": file_path},
+            )
+            
+    start_time = time()
+    df_batch.to_sql(
+        table_name,
+        engine,
+        if_exists="append",     # creates table on first call, appends after
+        index=False,
+        chunksize=100_000,      # pandas batches INSERT internally - no loop needed here
+        method="multi",
+    )
+    print(f"Loaded {len(df_batch)} rows into '{table_name}' in {time() - start_time:.2f}s")
+    
     
 
 if __name__ == "__main__":
 
     color_target = "green"
-    months_target = [1, 2, 3]
+    months_target = [1]#, 2, 3]
+    table_name = f"{color_target}_taxi"
     
     for month_idx in months_target:
         url_source = f"https://d37ci6vzurychx.cloudfront.net/trip-data/{color_target}_tripdata_2025-{month_idx:02}.parquet"     
@@ -83,6 +130,7 @@ if __name__ == "__main__":
             parquet_batch_file_path, 
             color_target
         )
+        load_data_batch(data_batch_transformed, parquet_batch_file_path, table_name)
         
         
         
