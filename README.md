@@ -1,7 +1,7 @@
 # Group Member Contributions
 
 - Niklas Pickert: branch `niklas-branch`
-- Amin Al-Ait: branch `...`
+- Amin Al-Ait: branch `amin-branch`
 
 
 # Data Pipeline Project
