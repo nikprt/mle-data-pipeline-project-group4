@@ -1,12 +1,13 @@
-from pathlib import Path 
-from time import time 
+from pathlib import Path
+from time import time
 from urllib.request import urlretrieve
 
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from sqlalchemy import create_engine, inspect, text 
-from sqlalchemy.engine import Engine 
+from prefect import flow, task
+from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.engine import Engine
 import os
 
 _engine: Engine | None = None
@@ -14,16 +15,18 @@ _engine: Engine | None = None
 ROOT_PATH = Path(__file__).resolve().parent
 REPORTS_DIR = ROOT_PATH / "reports"
 
-TABLE_NAME = "green_taxi"
-REPORT_QUERY = f"""
-    SELECT
-        pickup_datetime::date AS pickup_date,
-        COUNT(*) AS trips,
-        SUM(total_amount) AS revenue
-    FROM {TABLE_NAME}
-    GROUP BY 1
-    ORDER BY 1;
-"""
+
+def _report_query(table_name: str) -> str:
+    # table_name is only ever built from our own color_target, never user input
+    return f"""
+        SELECT
+            pickup_datetime::date AS pickup_date,
+            COUNT(*) AS trips,
+            SUM(total_amount) AS revenue
+        FROM {table_name}
+        GROUP BY 1
+        ORDER BY 1;
+    """
 
 def _database_url() -> str:
     user = os.getenv("PG_USER", "postgres")
@@ -44,6 +47,7 @@ def get_engine() -> Engine:
 
 print(f"ROOT_PATH: {ROOT_PATH}")
 
+@task(retries=3, retry_delay_seconds=10, log_prints=True)
 def extract_data_batch_from_url(url: str, file_path: str) -> pd.DataFrame:
     """Read a parquet file from a given URL and write it to a local parquet file."""
     Path(file_path).parent.mkdir(parents=True, exist_ok=True)
@@ -51,6 +55,7 @@ def extract_data_batch_from_url(url: str, file_path: str) -> pd.DataFrame:
     df_batch = pd.read_parquet(f"{file_path}")
     return df_batch
 
+@task(log_prints=True)
 def transform_data_batch(df_batch: pd.DataFrame, file_path: str, color_target: str) -> pd.DataFrame:
     """Transform DataFrame of taxi batch data."""
 
@@ -95,6 +100,7 @@ def transform_data_batch(df_batch: pd.DataFrame, file_path: str, color_target: s
     
     return df_batch
 
+@task(retries=2, retry_delay_seconds=5, log_prints=True)
 def load_data_batch(df_batch: pd.DataFrame, file_path: str, table_name: str):
     """Load transformed data batch into PostgreSQL database."""
     
@@ -120,27 +126,30 @@ def load_data_batch(df_batch: pd.DataFrame, file_path: str, table_name: str):
     print(f"Loaded {len(df_batch)} rows into '{table_name}' in {time() - start_time:.2f}s")
     
 
-def fetch_daily_revenue(engine: Engine) -> pd.DataFrame:
+@task(log_prints=True)
+def fetch_daily_revenue(engine: Engine, table_name: str) -> pd.DataFrame:
     """Query the revenue-per-day report from the database."""
-    df_report = pd.read_sql(text(REPORT_QUERY), engine)
+    df_report = pd.read_sql(text(_report_query(table_name)), engine)
     df_report["pickup_date"] = pd.to_datetime(df_report["pickup_date"])
     print(f"--> Fetched {len(df_report)} days of report data "
           f"({df_report['pickup_date'].min().date()} to {df_report['pickup_date'].max().date()})")
     return df_report
-    
+
+@task(log_prints=True)
 def save_report_csv(df_report: pd.DataFrame, file_path: Path) -> None:
     file_path.parent.mkdir(parents=True, exist_ok=True)
     df_report.to_csv(file_path, index=False)
     print(f"--> Saved report CSV to {file_path}")
-    
-def plot_daily_revenue(df_report: pd.DataFrame, file_path: Path) -> None:
+
+@task(log_prints=True)
+def plot_daily_revenue(df_report: pd.DataFrame, file_path: Path, table_name: str) -> None:
     """Line plot: revenue (USD) per day, dates shown as strings on the x-axis."""
     date_labels = df_report["pickup_date"].dt.strftime("%Y-%m-%d")
 
     fig, ax = plt.subplots(figsize=(14, 6))
     ax.plot(date_labels, df_report["revenue"], marker="o", markersize=3, linewidth=1)
 
-    ax.set_title(f"Daily Revenue — {TABLE_NAME}")
+    ax.set_title(f"Daily Revenue — {table_name}")
     ax.set_xlabel("Date")
     ax.set_ylabel("Revenue (USD)")
 
@@ -157,7 +166,8 @@ def plot_daily_revenue(df_report: pd.DataFrame, file_path: Path) -> None:
     plt.close(fig)
     print(f"--> Saved daily revenue line plot to {file_path}")
     
-def plot_revenue_by_weekday(df_report: pd.DataFrame, file_path: Path) -> None:
+@task(log_prints=True)
+def plot_revenue_by_weekday(df_report: pd.DataFrame, file_path: Path, table_name: str) -> None:
     """Bar plot: average revenue by day of week — reveals weekly seasonality
     (e.g. weekend vs. weekday demand) that's hard to spot in the daily line plot."""
     weekday_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
@@ -173,7 +183,7 @@ def plot_revenue_by_weekday(df_report: pd.DataFrame, file_path: Path) -> None:
     fig, ax = plt.subplots(figsize=(10, 6))
     ax.bar(avg_by_weekday.index, avg_by_weekday.values, color="steelblue")
 
-    ax.set_title(f"Average Revenue by Day of Week — {TABLE_NAME}")
+    ax.set_title(f"Average Revenue by Day of Week — {table_name}")
     ax.set_xlabel("Day of Week")
     ax.set_ylabel("Average Revenue (USD)")
     ax.tick_params(axis="x", rotation=45)
@@ -185,34 +195,35 @@ def plot_revenue_by_weekday(df_report: pd.DataFrame, file_path: Path) -> None:
     plt.close(fig)
     print(f"--> Saved revenue-by-weekday bar plot to {file_path}")
 
-if __name__ == "__main__":
-
-    color_target = "green"
-    months_target = [1, 2, 3]
+@flow(name="green-taxi-etl-flow", log_prints=True)
+def taxi_etl_flow(color_target: str = "green", months_target: tuple[int, ...] = (1, 2, 3)) -> None:
     table_name = f"{color_target}_taxi"
-    
+
     for month_idx in months_target:
-        url_source = f"https://d37ci6vzurychx.cloudfront.net/trip-data/{color_target}_tripdata_2025-{month_idx:02}.parquet"     
+        url_source = f"https://d37ci6vzurychx.cloudfront.net/trip-data/{color_target}_tripdata_2025-{month_idx:02}.parquet"
         parquet_batch_file_path = str(ROOT_PATH / "data" / f"{color_target}_tripdate_2025-{month_idx:02}.parquet")
         print(f"--- " * 5)
         print(f"Month {month_idx}: URL source of data batch: {url_source}; Parquet Batch File Path: {parquet_batch_file_path}")
-        
+
         # download data batch from url and save as .parquet file
         data_batch_raw = extract_data_batch_from_url(url_source, parquet_batch_file_path)
         print(f"Shape of data batch downloaded = {data_batch_raw.shape}")
-        
+
         # transform the data
         data_batch_transformed = transform_data_batch(
-            data_batch_raw, 
-            parquet_batch_file_path, 
+            data_batch_raw,
+            parquet_batch_file_path,
             color_target
         )
         load_data_batch(data_batch_transformed, parquet_batch_file_path, table_name)
-        
-    print(f"Successfully fetched data for the target months (months {months_target}). Creating report now...")    
-    
-    report_df = fetch_daily_revenue(get_engine())
-    save_report_csv(report_df, REPORTS_DIR / f"{TABLE_NAME}_daily_revenue.csv")
-    plot_daily_revenue(report_df, REPORTS_DIR / f"{TABLE_NAME}_daily_revenue.png")
-    plot_revenue_by_weekday(report_df, REPORTS_DIR / f"{TABLE_NAME}_revenue_by_weekday.png")
-        
+
+    print(f"Successfully fetched data for the target months (months {list(months_target)}). Creating report now...")
+
+    report_df = fetch_daily_revenue(get_engine(), table_name)
+    save_report_csv(report_df, REPORTS_DIR / f"{table_name}_daily_revenue.csv")
+    plot_daily_revenue(report_df, REPORTS_DIR / f"{table_name}_daily_revenue.png", table_name)
+    plot_revenue_by_weekday(report_df, REPORTS_DIR / f"{table_name}_revenue_by_weekday.png", table_name)
+
+
+if __name__ == "__main__":
+    taxi_etl_flow()
