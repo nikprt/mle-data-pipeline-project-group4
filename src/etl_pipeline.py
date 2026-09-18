@@ -3,6 +3,7 @@ from time import time
 from urllib.request import urlretrieve
 
 import pandas as pd
+import matplotlib.pyplot as plt
 
 from sqlalchemy import create_engine, inspect, text 
 from sqlalchemy.engine import Engine 
@@ -11,6 +12,18 @@ import os
 _engine: Engine | None = None
 
 ROOT_PATH = Path(__file__).resolve().parent
+REPORTS_DIR = ROOT_PATH / "reports"
+
+TABLE_NAME = "green_taxi"
+REPORT_QUERY = f"""
+    SELECT
+        pickup_datetime::date AS pickup_date,
+        COUNT(*) AS trips,
+        SUM(total_amount) AS revenue
+    FROM {TABLE_NAME}
+    GROUP BY 1
+    ORDER BY 1;
+"""
 
 def _database_url() -> str:
     user = os.getenv("PG_USER", "postgres")
@@ -106,12 +119,76 @@ def load_data_batch(df_batch: pd.DataFrame, file_path: str, table_name: str):
     )
     print(f"Loaded {len(df_batch)} rows into '{table_name}' in {time() - start_time:.2f}s")
     
+
+def fetch_daily_revenue(engine: Engine) -> pd.DataFrame:
+    """Query the revenue-per-day report from the database."""
+    df_report = pd.read_sql(text(REPORT_QUERY), engine)
+    df_report["pickup_date"] = pd.to_datetime(df_report["pickup_date"])
+    print(f"--> Fetched {len(df_report)} days of report data "
+          f"({df_report['pickup_date'].min().date()} to {df_report['pickup_date'].max().date()})")
+    return df_report
     
+def save_report_csv(df_report: pd.DataFrame, file_path: Path) -> None:
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    df_report.to_csv(file_path, index=False)
+    print(f"--> Saved report CSV to {file_path}")
+    
+def plot_daily_revenue(df_report: pd.DataFrame, file_path: Path) -> None:
+    """Line plot: revenue (USD) per day, dates shown as strings on the x-axis."""
+    date_labels = df_report["pickup_date"].dt.strftime("%Y-%m-%d")
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    ax.plot(date_labels, df_report["revenue"], marker="o", markersize=3, linewidth=1)
+
+    ax.set_title(f"Daily Revenue — {TABLE_NAME}")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Revenue (USD)")
+
+    # with ~90 daily points, only label every 5th tick to keep the x-axis readable
+    step = max(1, len(date_labels) // 20)
+    ax.set_xticks(range(0, len(date_labels), step))
+    ax.set_xticklabels(date_labels[::step], rotation=90)
+
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(file_path, dpi=150)
+    plt.close(fig)
+    print(f"--> Saved daily revenue line plot to {file_path}")
+    
+def plot_revenue_by_weekday(df_report: pd.DataFrame, file_path: Path) -> None:
+    """Bar plot: average revenue by day of week — reveals weekly seasonality
+    (e.g. weekend vs. weekday demand) that's hard to spot in the daily line plot."""
+    weekday_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+    df_weekday = df_report.copy()
+    df_weekday["weekday"] = df_weekday["pickup_date"].dt.day_name()
+    avg_by_weekday = (
+        df_weekday.groupby("weekday")["revenue"]
+        .mean()
+        .reindex(weekday_order)
+    )
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.bar(avg_by_weekday.index, avg_by_weekday.values, color="steelblue")
+
+    ax.set_title(f"Average Revenue by Day of Week — {TABLE_NAME}")
+    ax.set_xlabel("Day of Week")
+    ax.set_ylabel("Average Revenue (USD)")
+    ax.tick_params(axis="x", rotation=45)
+    ax.grid(True, axis="y", alpha=0.3)
+    fig.tight_layout()
+
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(file_path, dpi=150)
+    plt.close(fig)
+    print(f"--> Saved revenue-by-weekday bar plot to {file_path}")
 
 if __name__ == "__main__":
 
     color_target = "green"
-    months_target = [1]#, 2, 3]
+    months_target = [1, 2, 3]
     table_name = f"{color_target}_taxi"
     
     for month_idx in months_target:
@@ -132,7 +209,10 @@ if __name__ == "__main__":
         )
         load_data_batch(data_batch_transformed, parquet_batch_file_path, table_name)
         
-        
-        
-        
+    print(f"Successfully fetched data for the target months (months {months_target}). Creating report now...")    
+    
+    report_df = fetch_daily_revenue(get_engine())
+    save_report_csv(report_df, REPORTS_DIR / f"{TABLE_NAME}_daily_revenue.csv")
+    plot_daily_revenue(report_df, REPORTS_DIR / f"{TABLE_NAME}_daily_revenue.png")
+    plot_revenue_by_weekday(report_df, REPORTS_DIR / f"{TABLE_NAME}_revenue_by_weekday.png")
         
